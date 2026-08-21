@@ -92,16 +92,16 @@ def _report_span(
     attributes: dict[str, Any] | None = None,
     identity: dict[str, Any] | None = None,
 ) -> None:
-    """Report one completed span through verl's RLInsightLogger adapter.
+    """Report one completed span through the unified rl-insight facade.
 
-    Common trace labels from the current context are merged first, so callers
-    only need to add span-specific attributes.
+    The facade's ``trace_span`` delegates to verl's ``RLInsightLogger.trace_span``
+    (env gate + version check + lazy init live there), so the gateway flow is
+    unchanged. Common trace labels from the current context are merged first,
+    so callers only need to add span-specific attributes.
     """
+    from . import trace_span
+
     merged_attributes = {**(identity or _get_trace_identity()), **(attributes or {})}
-    trace_span = getattr(RLInsightLogger, "trace_span", None)
-    if trace_span is None:
-        _warn_once("verl.trace_span", "installed verl does not provide RLInsightLogger.trace_span")
-        return
     try:
         trace_span(
             name=name,
