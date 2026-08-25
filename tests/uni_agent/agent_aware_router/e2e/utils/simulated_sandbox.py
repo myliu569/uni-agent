@@ -1,4 +1,4 @@
-"""Simulated sandbox for llm_router e2e tests — no real container involved.
+"""Simulated sandbox for agent_aware_router e2e tests — no real container involved.
 
 Rewrites the uni-agent-sglang ``SimulatedRuntime`` asset onto the current
 ``AgentRunner`` architecture: instead of stubbing swerex's AbstractRuntime,
@@ -9,7 +9,7 @@ sglang repo, hand-tuned weights preserved).
 
 The LLM (vLLM replicas + KVCAware router) runs for real; only the sandbox
 side of the agent loop is simulated. That keeps the e2e assertions —
-``routed to server`` / ``COMBINED`` / ``Mean RM Score`` / trajectory
+``routed to server`` / ``COMBINED`` / ``mean rm_score`` / trajectory
 output — meaningful while dropping the container dependency.
 """
 
@@ -156,7 +156,10 @@ class _SimulatedSession:
         self._sampler = sampler
         self._max_turns = max_turns
         self._messages: list[dict[str, Any]] = [
-            {"role": "system", "content": "You are a helpful coding agent. Use the tools to fix the issue, then submit."},
+            {
+                "role": "system",
+                "content": "You are a helpful coding agent. Use the tools to fix the issue, then submit.",
+            },
             {"role": "user", "content": task or "Resolve the task."},
         ]
 
@@ -192,9 +195,7 @@ class _SimulatedSession:
                     else:
                         route = self._sampler.route(str(arguments.get("command", "")))
                         observation = self._sampler.render(route)
-                    self._messages.append(
-                        {"role": "tool", "tool_call_id": call["id"], "content": observation}
-                    )
+                    self._messages.append({"role": "tool", "tool_call_id": call["id"], "content": observation})
                 if finished:
                     break
         return turns
@@ -217,7 +218,7 @@ async def simulated_runner(
 
         agent_runners:
           swe_agent:
-            runner_fqn: tests.uni_agent.llm_router.e2e.utils.simulated_sandbox.simulated_runner
+            runner_fqn: tests.uni_agent.agent_aware_router.e2e.utils.simulated_sandbox.simulated_runner
             runner_kwargs: {max_turns: 8, reward_score: 1.0}
     """
     sampler = _ObservationSampler(seed, observation_scale)
