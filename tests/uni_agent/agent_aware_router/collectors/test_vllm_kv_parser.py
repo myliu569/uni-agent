@@ -20,8 +20,10 @@ import logging
 
 import msgpack
 import pytest
+from conftest import mapping_event
 
 from uni_agent.agent_aware_router.collectors.parse.vllm.kv import VLLMKVParser
+from uni_agent.agent_aware_router.collectors.parse.vllm.kv_event import KVCacheEvent
 from uni_agent.agent_aware_router.types import Layer
 
 pytestmark = [pytest.mark.level0, pytest.mark.cpu]
@@ -29,7 +31,7 @@ pytestmark = [pytest.mark.level0, pytest.mark.cpu]
 
 def _stored_event(block_hash, parent, token_ids, block_size, medium):
     """A stored event entry: [tag, block_hashes, parent, token_ids, block_size, <unused>, medium]."""
-    return ["stored", [block_hash], parent, token_ids, block_size, None, medium]
+    return ["BlockStored", [block_hash], parent, token_ids, block_size, None, medium]
 
 
 def test_mixed_medium_frame_buckets_per_layer():
@@ -111,3 +113,75 @@ def test_parse_failure_surfaces_exception_not_swallowed():
     assert "{exc}" not in text  # placeholder must be gone
     assert "node1" in text  # node_id must interpolate
     assert "len=" in text and "head=c1c1c1" in text  # diagnostic preview present
+
+
+@pytest.mark.parametrize("medium", [None, "GPU", "CPU"])
+def test_mapping_matches_array_normalization(medium):
+    """Field-named events normalize identically, including real upstream tags."""
+    array_events = [
+        ["BlockStored", [101, 102], 100, [1, 2, 3, 4], 2, None, medium],
+        ["BlockRemoved", [101], medium, 0],
+        ["AllBlocksCleared"],
+    ]
+    mapping_events = [
+        {
+            "type": "BlockStored",
+            "block_hashes": [101, 102],
+            "parent_block_hash": 100,
+            "token_ids": [1, 2, 3, 4],
+            "block_size": 2,
+            "medium": medium,
+            "group_idx": 0,
+            "kv_cache_spec_kind": "full_attention",
+            "future_field": "ignored",
+        },
+        {"type": "BlockRemoved", "block_hashes": [101], "medium": medium, "group_idx": 0},
+        {"type": "AllBlocksCleared"},
+    ]
+    if medium is None:
+        for event in mapping_events:
+            event.pop("medium", None)
+    expected = KVCacheEvent.from_raw([0, array_events, 0], "node1")
+    assert len(expected) == 3
+    assert KVCacheEvent.from_raw([0, mapping_events, 0], "node1") == expected
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_wire_events_update_hash_mapping_and_remove(replay):
+    """Mapping events preserve parent chains across batches and remove hashes."""
+    parser = VLLMKVParser()
+    batches = [
+        [0, [mapping_event(["BlockStored", [101], None, [1, 2], 2, None, "GPU"])], 0],
+        [1, [mapping_event(["BlockStored", [102, 103], 101, [3, 4, 5, 6], 2, None, "GPU"])], 0],
+    ]
+    payloads = [batches] if replay else batches
+    added = []
+    for payload in payloads:
+        update = parser.parse(msgpack.packb(payload), "node1")
+        assert update is not None
+        added.extend(update.add_blocks[Layer.GPU])
+    assert len(added) == 3
+    assert list(parser.remote_to_local_block_hash.values()) == added
+    removed = parser.parse(msgpack.packb([2, [mapping_event(["BlockRemoved", [102], "GPU", 0])], 0]), "node1")
+    assert removed is not None
+    assert removed.remove_blocks[Layer.GPU] == [added[1]]
+    assert set(parser.remote_to_local_block_hash) == {"101", "103"}
+    cleared = parser.parse(msgpack.packb([3, [mapping_event(["AllBlocksCleared"])]]), "node1")
+    assert cleared is not None and cleared.clear_all
+
+
+def test_bad_mapping_does_not_discard_valid_sibling(caplog):
+    bad_event = {"type": "BlockStored"}
+    valid = {"type": "BlockRemoved", "block_hashes": [7]}
+    module_logger = logging.getLogger(KVCacheEvent.__module__)
+    module_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.DEBUG, logger=KVCacheEvent.__module__):
+            events = KVCacheEvent.from_raw([0, [bad_event, valid]], "node1")
+    finally:
+        module_logger.removeHandler(caplog.handler)
+    assert "Skipping malformed KV event (type=stored, node=node1)" in caplog.text
+    assert "block_hashes" in caplog.text
+    assert len(events) == 1
+    assert events[0].event_type == "removed"
+    assert events[0].block_hashes == ["7"]
