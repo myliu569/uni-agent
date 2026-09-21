@@ -56,9 +56,11 @@ class VLLMKVParser(Parser):
     def parse(self, raw_data: bytes | str, node_id: str) -> KVCacheUpdate | None:
         """Parse msgpack payload and return structured update command.
 
-        Handles both single event (real-time) and multiple events (replay):
-          - Single: [timestamp, [[tag, fields...], ...]]
-          - Multiple: [[timestamp, [...]], [timestamp, [...]]]
+        Handles both single batches (real-time) and multiple batches (replay):
+          - Single: [timestamp, [event, ...], ...]
+          - Multiple: [[timestamp, [...], ...], [timestamp, [...], ...]]
+        Each event may be a legacy positional array or a mapping with named
+        fields and a ``type`` discriminator.
 
         Args:
             raw_data: ZMQ payload bytes (msgpack-encoded).
