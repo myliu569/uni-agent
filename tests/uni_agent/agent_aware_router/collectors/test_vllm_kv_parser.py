@@ -34,7 +34,8 @@ def _stored_event(block_hash, parent, token_ids, block_size, medium):
     return ["BlockStored", [block_hash], parent, token_ids, block_size, None, medium]
 
 
-def test_mixed_medium_frame_buckets_per_layer():
+@pytest.mark.parametrize("cpu_medium", ["cpu", "CPU"])
+def test_mixed_medium_frame_buckets_per_layer(cpu_medium):
     """A single frame with a GPU and a cpu BlockStored keeps layers distinct.
 
     Regression: the old scalar medium_add aggregation let the later event's
@@ -46,7 +47,7 @@ def test_mixed_medium_frame_buckets_per_layer():
         1234567890,  # timestamp
         [
             _stored_event("rh_gpu", None, [1, 2], 2, "GPU"),
-            _stored_event("rh_cpu", None, [3, 4], 2, "cpu"),
+            _stored_event("rh_cpu", None, [3, 4], 2, cpu_medium),
         ],
     ]
 
@@ -60,6 +61,12 @@ def test_mixed_medium_frame_buckets_per_layer():
     assert len(update.add_blocks[Layer.CPU]) == 1
     # Different token ids → different local hashes per layer.
     assert update.add_blocks[Layer.GPU] != update.add_blocks[Layer.CPU]
+
+    # CPU removal must target only the CPU layer for either spelling.
+    removed = parser.parse(msgpack.packb([0, [["BlockRemoved", ["rh_cpu"], cpu_medium]]]), "node1")
+    assert removed is not None
+    assert removed.remove_blocks == {Layer.CPU: update.add_blocks[Layer.CPU]}
+    assert "rh_gpu" in parser.remote_to_local_block_hash
 
 
 def test_none_medium_defaults_to_gpu():
