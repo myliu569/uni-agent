@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for VLLMKVParser layer bucketing (mixed-medium frames)."""
+"""Unit tests for GPU-only VLLMKVParser updates and mixed-medium isolation."""
 
 from __future__ import annotations
 
@@ -35,50 +35,69 @@ def _stored_event(block_hash, parent, token_ids, block_size, medium):
 
 
 @pytest.mark.parametrize("cpu_medium", ["cpu", "CPU"])
-def test_mixed_medium_frame_buckets_per_layer(cpu_medium):
-    """A single frame with a GPU and a cpu BlockStored keeps layers distinct.
-
-    Regression: the old scalar medium_add aggregation let the later event's
-    medium overwrite the earlier one, so the whole batch was written under one
-    layer. Per-layer dict bucketing must keep each event's blocks in its layer.
-    """
+@pytest.mark.parametrize("wire_format", ["array", "mapping"])
+@pytest.mark.parametrize("replay", [False, True])
+def test_cpu_events_do_not_change_gpu_state(cpu_medium, wire_format, replay):
+    """CPU stores/removals with overlapping remote hashes cannot corrupt GPU state."""
     parser = VLLMKVParser()
-    payload = [
-        1234567890,  # timestamp
-        [
-            _stored_event("rh_gpu", None, [1, 2], 2, "GPU"),
-            _stored_event("rh_cpu", None, [3, 4], 2, cpu_medium),
-        ],
-    ]
 
-    update = parser.parse(msgpack.packb(payload), "node1")
+    def parse(*events):
+        if wire_format == "mapping":
+            events = [mapping_event(event) for event in events]
+        batch = [0, events]
+        return parser.parse(msgpack.packb([batch] if replay else batch), "node1")
 
+    # Intentionally different sizes diagnose isolation; not a real Mooncake layout claim.
+    cpu_only = parse(_stored_event("rh_gpu", None, [9, 8, 7, 6], 4, cpu_medium))
+    assert cpu_only is not None and not cpu_only.add_blocks
+    assert parser._block_size is None
+    assert not parser.remote_to_local_block_hash
+
+    update = parse(
+        _stored_event("rh_gpu", None, [1, 2], 2, "GPU"),
+        _stored_event("rh_gpu", None, [9, 8, 7, 6], 4, cpu_medium),
+        ["BlockRemoved", ["rh_gpu"], cpu_medium],
+        _stored_event("rh_child", "rh_gpu", [3, 4], 2, "GPU"),
+    )
     assert update is not None
-    # Both layers present — no cross-layer overwrite.
-    assert Layer.GPU in update.add_blocks
-    assert Layer.CPU in update.add_blocks
-    assert len(update.add_blocks[Layer.GPU]) == 1
-    assert len(update.add_blocks[Layer.CPU]) == 1
-    # Different token ids → different local hashes per layer.
-    assert update.add_blocks[Layer.GPU] != update.add_blocks[Layer.CPU]
+    gpu_only = VLLMKVParser().parse(
+        msgpack.packb(
+            [
+                0,
+                [
+                    _stored_event("parent", None, [1, 2], 2, "GPU"),
+                    _stored_event("child", "parent", [3, 4], 2, "GPU"),
+                ],
+            ]
+        ),
+        "node1",
+    )
+    assert update.add_blocks == gpu_only.add_blocks
+    assert not update.remove_blocks
+    assert parser._block_size == 2
+    assert parser.remote_to_local_block_hash["rh_gpu"] == update.add_blocks[Layer.GPU][0]
 
-    # CPU removal must target only the CPU layer for either spelling.
-    removed = parser.parse(msgpack.packb([0, [["BlockRemoved", ["rh_cpu"], cpu_medium]]]), "node1")
+    removed = parse(["BlockRemoved", ["rh_gpu"], "GPU"])
     assert removed is not None
-    assert removed.remove_blocks == {Layer.CPU: update.add_blocks[Layer.CPU]}
-    assert "rh_gpu" in parser.remote_to_local_block_hash
+    assert removed.remove_blocks == {Layer.GPU: update.add_blocks[Layer.GPU][:1]}
+    assert "rh_gpu" not in parser.remote_to_local_block_hash
+    cleared = parse(["AllBlocksCleared"])
+    assert cleared is not None and cleared.clear_all
 
 
-def test_none_medium_defaults_to_gpu():
-    """Older vLLM events without medium default to the GPU layer."""
+@pytest.mark.parametrize("medium", [None, "GPU", "gpu", "unknown"])
+def test_legacy_and_gpu_medium_preserve_gpu_updates(medium):
+    """Keep existing missing/unknown-medium compatibility and GPU case folding."""
     parser = VLLMKVParser()
-    payload = [0, [_stored_event("rh", None, [1, 2], 2, None)]]
+    payload = [0, [_stored_event("rh", None, [1, 2], 2, medium)]]
 
     update = parser.parse(msgpack.packb(payload), "node1")
 
     assert update is not None
     assert Layer.GPU in update.add_blocks
     assert Layer.CPU not in update.add_blocks
+    removed = parser.parse(msgpack.packb([0, [["BlockRemoved", ["rh"], medium]]]), "node1")
+    assert removed is not None and removed.remove_blocks == {Layer.GPU: update.add_blocks[Layer.GPU]}
 
 
 def test_clear_event_sets_clear_all():

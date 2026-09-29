@@ -15,7 +15,8 @@
 """VLLMKVParser — vLLM KV-cache event parser.
 
 Parses msgpack payloads from ZMQ and returns structured update commands.
-Store writes are handled by Collector via DataStore.
+Store writes are handled by Collector via DataStore. Explicit CPU Stored/Removed
+events are ignored: this router tracks GPU residency, not the external Store.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ class VLLMKVParser(Parser):
         remote_to_local_block_hash: Mapping from vLLM remote block_hash
             to locally-computed prefix hash (str).  Used for chained
             hash computation.
-        _block_size: Learned block size from first event.
+        _block_size: Learned block size from first eligible GPU stored event.
     """
 
     # vLLM BlockStored/BlockRemoved ``medium`` → canonical layer.
@@ -112,6 +113,8 @@ class VLLMKVParser(Parser):
 
     def _on_block_stored(self, event: KVCacheEvent, update: KVCacheUpdate) -> None:
         """Handle BlockStored: learn block_size, compute local hashes, fold into update."""
+        if self._medium_to_layer(event.medium) == Layer.CPU:
+            return
         if event.token_ids is None:
             logger.debug("Stored event has no token_ids — skipping")
             return
@@ -146,6 +149,8 @@ class VLLMKVParser(Parser):
 
     def _on_block_removed(self, event: KVCacheEvent, update: KVCacheUpdate) -> None:
         """Handle BlockRemoved: convert remote hashes to local, fold into update."""
+        if self._medium_to_layer(event.medium) == Layer.CPU:
+            return
         local_hashes = [
             self.remote_to_local_block_hash[bh] for bh in event.block_hashes if bh in self.remote_to_local_block_hash
         ]

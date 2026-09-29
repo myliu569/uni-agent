@@ -33,6 +33,8 @@ from conftest import BLOCK_SIZE, NODE_ID, FakeZMQTransport, kv_payload, make_sto
 from uni_agent.agent_aware_router.collectors.collector import Collector
 from uni_agent.agent_aware_router.collectors.parse.vllm.kv import VLLMKVParser
 from uni_agent.agent_aware_router.store.data_store import DataStore
+from uni_agent.agent_aware_router.types import Layer
+from uni_agent.agent_aware_router.utils.hash import get_prefix_hashes_incremental
 
 pytestmark = [pytest.mark.level0, pytest.mark.cpu]
 
@@ -148,3 +150,22 @@ def test_wire_events_change_store():
     assert store.get_block_size() == BLOCK_SIZE
     assert store.get_kv_block_count() == 1
     assert set(collector._parser.remote_to_local_block_hash) == {"101"}
+
+
+@pytest.mark.parametrize("remove_gpu", [False, True])
+def test_cpu_events_preserve_gpu_hit_and_counts(remove_gpu):
+    """CPU writes never reach the store; CPU removal cannot hide later GPU eviction."""
+    tokens = list(range(2 * BLOCK_SIZE))
+    gpu_store = ["BlockStored", [101, 102], None, tokens, BLOCK_SIZE, None, "GPU"]
+    cpu_store = ["BlockStored", [101], None, tokens, 2 * BLOCK_SIZE, None, "cpu"]
+    events = [cpu_store, gpu_store, cpu_store, ["BlockRemoved", [101], "CPU"]]
+    payloads = [kv_payload(*(mapping_event(event) for event in events))]
+    if remove_gpu:
+        # A later eviction must still resolve the GPU mapping after CPU removal.
+        payloads.append(kv_payload(mapping_event(["BlockRemoved", [101], "GPU"])))
+    store, _ = _run(payloads)
+    hashes, _ = get_prefix_hashes_incremental(tokens, BLOCK_SIZE, 0, 0)
+    assert store.get_block_size() == BLOCK_SIZE
+    assert store.get_layer_prefix_hit_rate(NODE_ID, [str(h) for h in hashes]) == (0.0 if remove_gpu else 1.0)
+    assert store.per_replica_block_counts() == {NODE_ID: 1 if remove_gpu else 2}
+    assert store._kv._replica_layer_counts[Layer.CPU] == {}

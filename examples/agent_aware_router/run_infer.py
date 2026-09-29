@@ -122,6 +122,68 @@ def _resolve_router_config_path(path: str) -> str:
     return os.path.abspath(path)
 
 
+def _prepare_mooncake_env(args: argparse.Namespace) -> dict[str, str]:
+    """Validate the optional config before starting Ray; return job environment."""
+    if not args.enable_mooncake:
+        return {}
+    path = Path(args.mooncake_config_path).expanduser().resolve()
+    try:
+        with path.open(encoding="utf-8") as stream:
+            config = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read Mooncake JSON config {path}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"Mooncake config must be a JSON object: {path}")
+    # Connector-specific fields are validated by the installed engine version.
+    args.mooncake_config_path = str(path)
+    env_vars = {"MOONCAKE_CONFIG_PATH": str(path)}
+    # Explicitly propagate optional Store controls when joining an existing cluster.
+    for name in (
+        "MOONCAKE_PREFERRED_SEGMENT",
+        "MOONCAKE_REQUESTER_LOCAL_HOSTNAME",
+        "VLLM_MOONCAKE_STORE_TIER_LOG",
+        "PYTHONHASHSEED",
+    ):
+        if name in os.environ:
+            env_vars[name] = os.environ[name]
+    os.environ["MOONCAKE_CONFIG_PATH"] = str(path)
+    return env_vars
+
+
+def _init_ray(args: argparse.Namespace) -> None:
+    """Pass Mooncake configuration at job scope, including address='auto'."""
+    env_vars = _prepare_mooncake_env(args)
+    if ray.is_initialized():
+        if env_vars:
+            active_env = ray.get_runtime_context().runtime_env.get("env_vars", {})
+            if any(active_env.get(key) != value for key, value in env_vars.items()):
+                raise ValueError(
+                    "Ray is already initialized without the requested Mooncake runtime_env; start a new job"
+                )
+        return
+    kwargs = {"runtime_env": {"env_vars": env_vars}} if env_vars else {}
+    if os.environ.get("RAY_ADDRESS"):
+        ray.init(address="auto", **kwargs)
+    else:
+        # Keep agent workers alive between dispatches, as in the non-Mooncake path.
+        ray.init(_system_config={"idle_worker_killing_time_threshold_ms": _RAY_IDLE_WORKER_TIMEOUT_MS}, **kwargs)
+
+
+def _mooncake_transfer_config(args: argparse.Namespace) -> dict | None:
+    if not args.enable_mooncake:
+        return None
+    extra_config = {}
+    if args.device == "gpu":
+        extra_config["save_decode_cache"] = args.mooncake_save_decode_cache
+    elif args.mooncake_save_decode_cache:
+        raise ValueError("--mooncake-save-decode-cache is only supported by this entrypoint on --device gpu")
+    return {
+        "kv_connector": "MooncakeConnectorStoreV1" if args.device == "ascend" else "MooncakeStoreConnector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": extra_config,
+    }
+
+
 def init_config(args: argparse.Namespace, *, served_model_name: str):
     """Compose verl's ``ppo_trainer`` config with the KV-cache-aware router plugin and
     override the engine + framework knobs.
@@ -183,14 +245,14 @@ def init_config(args: argparse.Namespace, *, served_model_name: str):
     # vLLM engine kwargs: MFU metric (always on) + optional mooncake connector / kv-events.
     vllm_kwargs: dict = {"enable_mfu_metrics": True}
     if args.enable_mooncake:
-        # Cross-replica KV sharing via mooncake (config via MOONCAKE_CONFIG_PATH env).
-        # GPU build uses "MooncakeStoreConnector"; vllm-ascend uses "MooncakeConnectorStoreV1".
-        mooncake_connector = "MooncakeConnectorStoreV1" if args.device == "ascend" else "MooncakeStoreConnector"
-        vllm_kwargs["kv_transfer_config"] = {
-            "kv_connector": mooncake_connector,
-            "kv_role": "kv_both",
-            "kv_connector_extra_config": {},
-        }
+        vllm_kwargs["kv_transfer_config"] = _mooncake_transfer_config(args)
+        logger.info(
+            "Mooncake enabled: config=%s kv_transfer_config=%s",
+            args.mooncake_config_path,
+            vllm_kwargs["kv_transfer_config"],
+        )
+    else:
+        logger.info("Mooncake disabled")
     if args.kv_events:
         # vLLM kv-events (zmq publisher) — kvcaware load signal (retained-cache
         # occupancy). Ports are placeholders (the uni-agent kv-events server
@@ -360,6 +422,11 @@ def _report(
             "mean_rm_score_over_prompts": mean_over_prompts,
             "scores": scores,
             "scores_by_uid": per_uid,
+            "mooncake": {
+                "enabled": args.enable_mooncake,
+                "config_path": args.mooncake_config_path if args.enable_mooncake else None,
+                "kv_transfer_config": _mooncake_transfer_config(args),
+            },
         }
         with open(result_path, "w") as f:
             json.dump(payload, f, indent=2)
@@ -521,6 +588,12 @@ def main() -> None:
         help="Path to the mooncake config JSON (used with --enable-mooncake).",
     )
     parser.add_argument(
+        "--mooncake-save-decode-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save completed decode KV blocks to Mooncake (GPU only, default: disabled).",
+    )
+    parser.add_argument(
         "--device",
         choices=["gpu", "ascend"],
         default="gpu",
@@ -539,16 +612,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.enable_mooncake and args.mooncake_config_path:
-        os.environ["MOONCAKE_CONFIG_PATH"] = os.path.expanduser(args.mooncake_config_path)
-
-    if not ray.is_initialized():
-        if os.environ.get("RAY_ADDRESS"):
-            ray.init(address="auto")
-        else:
-            # Disable Ray's idle-worker reaper so agent workers survive dispatch gaps
-            # (default ~10 s threshold would kill them prematurely).
-            ray.init(_system_config={"idle_worker_killing_time_threshold_ms": _RAY_IDLE_WORKER_TIMEOUT_MS})
+    _init_ray(args)
 
     TaskConfigResolver.from_file(args.task_config)
     served_model_name = os.path.basename(os.path.expanduser(args.model_path).rstrip("/"))
