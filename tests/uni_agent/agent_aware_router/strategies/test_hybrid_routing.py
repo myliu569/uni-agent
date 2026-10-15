@@ -4,6 +4,7 @@ import msgpack
 import pytest
 
 from uni_agent.agent_aware_router.collectors.collector import Collector
+from uni_agent.agent_aware_router.collectors.parse.base import KVCacheUpdate
 from uni_agent.agent_aware_router.collectors.parse.vllm.kv import VLLMKVParser
 from uni_agent.agent_aware_router.store.data_store import DataStore
 from uni_agent.agent_aware_router.store.kv_cache_store import KVCacheStore
@@ -44,8 +45,9 @@ def strategy(mode=SlowCut.PREFIX_LOAD_AWARE):
 @pytest.fixture
 def populate(parse, stored):
     def make_populate(store):
-        store.apply_group_events("a", parse([stored(), stored(1, "mamba", 8, hashes=["r8"])]))
-        store.apply_group_events("b", parse([stored(), stored(1, "mamba", 8, hashes=["r16"])]))
+        for node, checkpoint in (("a", "r8"), ("b", "r16")):
+            events = parse([stored(), stored(1, "mamba", 8, hashes=[checkpoint])], node)
+            store.apply_kv_update(KVCacheUpdate(node_id=node, group_events=events))
 
     return make_populate
 
@@ -69,13 +71,14 @@ def test_collected_events_route_by_common_hit_and_group_removal(store, parse, re
     assert results["b"].hit_rate == 16 / 17
     # A partial Stored whose parent has not been published must not suppress
     # either replica's already established cache score.
-    store.apply_group_events("b", parse([stored(block=2, parent="r20", hashes=["r22"], tokens=[20, 21])]))
+    events = parse([stored(block=2, parent="r20", hashes=["r22"], tokens=[20, 21])], "b")
+    store.apply_kv_update(KVCacheUpdate(node_id="b", group_events=events))
     assert store.estimate_prefixes(["a", "b"], hashes, 17) == results
     # Pending aliases affect retention while established prefix hits stay intact.
     assert store.per_replica_block_counts() == {"a": 5, "b": 6}
     pending_scores = strategy().score(list(range(17)), store, replicas)
     assert pending_scores[1] < scores[1] and pending_scores[1] > pending_scores[0]
-    store.apply_group_events("b", parse([removed(1, ["r16"])]))
+    store.apply_kv_update(KVCacheUpdate(node_id="b", group_events=parse([removed(1, ["r16"])], "b")))
     scores = strategy().score(list(range(17)), store, replicas)
     assert scores[0] > scores[1]
 
@@ -94,8 +97,8 @@ def test_replay_uses_saved_tokens_in_scores_and_capacity_selection(store, layout
     raw["groups"][1].update(prefix_cacheable=False, prefix_replay_tokens=8)
     raw["kv_cache_capacity_tokens"] = 1000
     store.configure_cache_registry(raw)
-    store.apply_group_events("a", parse([stored()]))
-    store.apply_group_events("b", parse([stored(tokens=list(range(8)))]))
+    store.apply_kv_update(KVCacheUpdate(node_id="a", group_events=parse([stored()])))
+    store.apply_kv_update(KVCacheUpdate(node_id="b", group_events=parse([stored(tokens=list(range(8)))], "b")))
     prompt = list(range(17))
     replicas = [ReplicaInfo("a"), ReplicaInfo("b")]
     prefix = strategy()
@@ -124,7 +127,8 @@ def test_capacity_uses_real_tokens_not_local_hash_or_group_entry_counts(store, l
     # Substituting legacy block capacity would overstate that cost and select a.
     for node, usage in (("a", 0.0), ("b", 0.005)):
         store.refresh_metrics({node: {MetricKey.NUM_GPU_BLOCKS: 100, MetricKey.KV_CACHE_USAGE_PERC: usage}})
-    store.apply_group_events("b", parse([stored(parent="r20", block=2, tokens=[20, 21], hashes=["r22"])]))
+    events = parse([stored(parent="r20", block=2, tokens=[20, 21], hashes=["r22"])], "b")
+    store.apply_kv_update(KVCacheUpdate(node_id="b", group_events=events))
     assert store.kv_cache_load("b") - store.kv_cache_load("a") == pytest.approx(0.01)
     strat = strategy(SlowCut.CAPACITY_TOKEN_AWARE)
     strat.tie_tolerance = 0.0  # Isolate token-capacity arithmetic from near-best sampling.

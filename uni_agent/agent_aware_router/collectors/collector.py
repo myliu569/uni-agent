@@ -121,7 +121,7 @@ class Collector:
             asyncio.set_event_loop(self._loop)
             self._loop.run_forever()
 
-        def handler(raw_data: bytes | str, node_id: str) -> None:
+        def handler(raw_data: Any, node_id: str) -> None:
             """Handler: parse and dispatch to the right store write path."""
             result = self._parser.parse(raw_data, node_id)
             if isinstance(result, KVCacheUpdate):
@@ -157,22 +157,13 @@ class Collector:
 
     def _write_kv_update(self, update: KVCacheUpdate) -> None:
         """Write KVCacheUpdate via DataStore, then emit a periodic kv-events tally."""
+        if not self._data_store.apply_kv_update(update):
+            return
         if update.group_events is not None:
-            self._data_store.apply_group_events(update.node_id, update.group_events)
             n_added = sum(len(e.block_hashes) for e in update.group_events if e.is_store)
             n_removed = sum(len(e.block_hashes) for e in update.group_events if e.is_remove)
             n_clear = sum(e.is_clear for e in update.group_events)
         else:
-            if update.block_size is not None:
-                self._data_store.set_block_size(update.block_size)
-            if update.clear_all:
-                self._data_store.clear_kv_node(update.node_id)
-            for layer, hashes in update.remove_blocks.items():
-                if hashes:
-                    self._data_store.remove_kv_blocks(update.node_id, hashes, layer=layer)
-            for layer, hashes in update.add_blocks.items():
-                if hashes:
-                    self._data_store.add_kv_blocks(update.node_id, hashes, layer=layer)
             n_added = sum(len(v) for v in update.add_blocks.values())
             n_removed = sum(len(v) for v in update.remove_blocks.values())
             n_clear = int(update.clear_all)
@@ -472,8 +463,14 @@ def get_collector(
             max_retry_delay=_debug_knob("max_retry_delay"),
             max_retry_attempts=_debug_knob("max_retry_attempts"),
             retry_backoff_factor=_debug_knob("retry_backoff_factor"),
+            deliver_frames=True,
         )
-        return Collector(transport, VLLMKVParser(group_aware=DataStore().group_cache_enabled))
+        return Collector(
+            transport,
+            VLLMKVParser(
+                group_aware=DataStore().group_cache_enabled, lifecycle_reader=DataStore().cache_lifecycle_state
+            ),
+        )
 
     if name == "sticky_stat":
         from .parse.basic.sticky import StickyParser

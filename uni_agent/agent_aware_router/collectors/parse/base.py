@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ...types import Layer
+from ...types.cache_lifecycle import CacheLifecycleState
 
 if TYPE_CHECKING:
     from .vllm.kv_event import KVCacheEvent
@@ -55,6 +56,9 @@ class KVCacheUpdate:
     clear_all: bool = False
     block_size: int | None = None
     group_events: list[KVCacheEvent] | None = None
+    lifecycle: CacheLifecycleState | None = None
+    sequence: int | None = None
+    stream_error: str | None = None
 
     def add(self, layer: Layer, block_hashes: list[str]) -> None:
         """Fold stored blocks into ``add_blocks`` under ``layer``."""

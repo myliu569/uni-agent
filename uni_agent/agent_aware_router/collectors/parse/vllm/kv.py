@@ -27,6 +27,7 @@ import msgpack
 from ....collectors.parse import KVCacheUpdate, Parser
 from ....collectors.parse.vllm.kv_event import KVCacheEvent
 from ....types import Layer
+from ....types.cache_lifecycle import BRIDGE_SCHEMA_KEY, CacheLifecycleState, KVEventFrame
 from ....utils.hash import compute_hash
 
 logger = logging.getLogger(__name__)
@@ -49,10 +50,28 @@ class VLLMKVParser(Parser):
     # Unknown / None (older vLLM) → GPU (see ``_medium_to_layer``).
     _MEDIUM_TO_LAYER: dict[str, Layer] = {"GPU": Layer.GPU, "CPU": Layer.CPU}
 
-    def __init__(self, *, group_aware: bool = False) -> None:
+    def __init__(self, *, group_aware: bool = False, lifecycle_reader=None) -> None:
         self.group_aware = group_aware
+        self.lifecycle_reader = lifecycle_reader
         self.remote_to_local_block_hash: dict[str, str] = {}
         self._block_size: int | None = None
+        self._contexts: dict[tuple, tuple[dict, int | None]] = {}
+        self._context_key = None
+
+    def _switch_context(self, node_id, lifecycle=None):
+        identity = (lifecycle.instance_id, lifecycle.epoch) if lifecycle else (None, None)
+        key = (node_id, *identity)
+        if key == self._context_key:
+            return
+        if self._context_key is not None:
+            self._contexts[self._context_key] = (self.remote_to_local_block_hash, self._block_size)
+        # A remote hash mapping belongs to one replica generation. Retire older
+        # contexts for this replica; never clear another replica's mappings.
+        for old in list(self._contexts):
+            if old[0] == node_id and old != key:
+                del self._contexts[old]
+        self.remote_to_local_block_hash, self._block_size = self._contexts.get(key, ({}, None))
+        self._context_key = key
 
     def parse(self, raw_data: bytes | str, node_id: str) -> KVCacheUpdate | None:
         """Parse msgpack payload and return structured update command.
@@ -70,18 +89,48 @@ class VLLMKVParser(Parser):
         Returns:
             KVCacheUpdate with operations to apply, or None if parsing failed.
         """
+        sequence = None
+        if isinstance(raw_data, KVEventFrame):
+            sequence = raw_data.sequence
+            if raw_data.error:
+                self._switch_context(node_id)
+                self.remote_to_local_block_hash.clear()
+                return KVCacheUpdate(node_id=node_id, stream_error=raw_data.error)
+            raw_data = raw_data.payload
         if isinstance(raw_data, str):
             logger.debug("VLLMKVParser received string data, expected bytes — skipping")
             return None
 
+        bridged = False
         try:
             raw = msgpack.unpackb(raw_data, raw=False)
+            lifetime = None
+            if isinstance(raw, dict) and BRIDGE_SCHEMA_KEY in raw:
+                bridged = True
+                if raw[BRIDGE_SCHEMA_KEY] != 1:
+                    raise ValueError("unsupported cache event bridge schema")
+                lifetime = CacheLifecycleState.from_dict(raw["state"])
+                sequence = raw["sequence"]
+                if raw.get("error"):
+                    return KVCacheUpdate(node_id=node_id, lifecycle=lifetime, stream_error=raw["error"])
+                raw = msgpack.unpackb(raw["payload"], raw=False) if raw["payload"] else [0, []]
+            current = self.lifecycle_reader(node_id) if self.lifecycle_reader else None
+            if current is not None and (
+                lifetime is None
+                or current.instance_id != lifetime.instance_id
+                or current.epoch != lifetime.epoch
+                or current.index_state != "ready"
+            ):
+                return None  # Reject obsolete identity before touching legacy mappings.
+            self._switch_context(node_id, lifetime)
 
             if not isinstance(raw, list | dict) or len(raw) == 0:
                 raise ValueError(f"Unexpected msgpack format (type={type(raw).__name__})")
             event_payloads = raw if isinstance(raw, list) and isinstance(raw[0], list | dict) else [raw]
 
-            update = KVCacheUpdate(node_id=node_id, group_events=[] if self.group_aware else None)
+            update = KVCacheUpdate(
+                node_id=node_id, group_events=[] if self.group_aware else None, lifecycle=lifetime, sequence=sequence
+            )
             for payload in event_payloads:
                 events = KVCacheEvent.from_raw(payload, default_node_id=node_id)
                 for event in events:
@@ -98,11 +147,13 @@ class VLLMKVParser(Parser):
                         raise ValueError(f"Unknow event.event_type {event.event_type}.")
             return update
 
-        except (msgpack.UnpackException, ValueError, TypeError) as exc:
+        except (msgpack.UnpackException, ValueError, TypeError, KeyError) as exc:
             preview = bytes(raw_data[:32]).hex() if isinstance(raw_data, bytes | bytearray) else str(raw_data)[:64]
             logger.warning(
                 f"Failed to parse msgpack payload from node {node_id}: {exc!r} (len={len(raw_data)}, head={preview})"
             )
+            if bridged:
+                return KVCacheUpdate(node_id=node_id, stream_error="invalid_bridge_envelope")
             return None
 
     @classmethod
@@ -159,4 +210,5 @@ class VLLMKVParser(Parser):
 
     def _on_all_blocks_cleared(self, event: KVCacheEvent, update: KVCacheUpdate) -> None:
         """Handle AllBlocksCleared: mark the replica for a full clear."""
+        self.remote_to_local_block_hash.clear()
         update.clear()

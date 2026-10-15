@@ -262,6 +262,7 @@ class TestBalancerProtocol:
             "route_calls": 0,
             "sticky_size": 0,
             "total_inflight": 0,
+            "cache_lifecycles": {},
         }
 
     def test_acquire_delegates_and_maps_selected_handle(self, monkeypatch):
