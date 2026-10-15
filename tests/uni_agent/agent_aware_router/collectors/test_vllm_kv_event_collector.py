@@ -39,8 +39,8 @@ pytestmark = [pytest.mark.level0, pytest.mark.cpu]
 WAIT = 0.3
 
 
-def _make_collector(payloads):
-    return Collector(FakeZMQTransport(payloads, interval=0.05), VLLMKVParser())
+def _make_collector(payloads, *, group_aware=False):
+    return Collector(FakeZMQTransport(payloads, interval=0.05), VLLMKVParser(group_aware=group_aware))
 
 
 def _block_ids(start: int = 0) -> list[int]:
@@ -48,10 +48,10 @@ def _block_ids(start: int = 0) -> list[int]:
     return list(range(start, start + BLOCK_SIZE))
 
 
-def _run(payloads):
+def _run(payloads, *, group_aware=False):
     """Start the collector over the given payloads, stop, return (store, collector)."""
     store = DataStore()
-    collector = _make_collector(payloads)
+    collector = _make_collector(payloads, group_aware=group_aware)
     collector.start()
     time.sleep(WAIT)
     collector.stop()
@@ -138,13 +138,34 @@ class TestVLLMKVEventCollector:
             assert store.has_kv_block(local_bh), f"Local hash '{local_bh}' from mapping not found in KV cache store"
 
 
-def test_wire_events_change_store():
-    """Mapping events store and remove blocks through the collector."""
+@pytest.mark.parametrize("group_aware", [False, True], ids=["legacy", "group-aware"])
+def test_wire_events_change_store(group_aware, layout):
+    """Both paths preserve valid updates alongside a malformed event."""
+    store = DataStore()
+    if group_aware:
+        store.configure_cache_registry(layout((("full_attention", BLOCK_SIZE),), unit=None))
     events = [
-        ["BlockStored", [101, 102], None, list(range(2 * BLOCK_SIZE)), BLOCK_SIZE, None, "GPU"],
+        [
+            "BlockStored",
+            [101, 102],
+            None,
+            list(range(2 * BLOCK_SIZE)),
+            BLOCK_SIZE,
+            None,
+            "GPU",
+            None,
+            None,
+            0,
+            "full_attention",
+        ],
+        ["BlockStored", ["bad"], None, [1], 0, None, "GPU"],
         ["BlockRemoved", [102], "GPU", 0],
     ]
-    store, collector = _run([kv_payload(mapping_event(event)) for event in events])
-    assert store.get_block_size() == BLOCK_SIZE
-    assert store.get_kv_block_count() == 1
-    assert set(collector._parser.remote_to_local_block_hash) == {"101"}
+    payloads = [kv_payload(mapping_event(events[0])), kv_payload(*(mapping_event(event) for event in events[1:]))]
+    store, collector = _run(payloads, group_aware=group_aware)
+    assert store.get_block_size() == (None if group_aware else BLOCK_SIZE)
+    if group_aware:
+        assert store.per_replica_block_counts() == {NODE_ID: 1}
+    else:
+        assert store.get_kv_block_count() == 1
+        assert set(collector._parser.remote_to_local_block_hash) == {"101"}

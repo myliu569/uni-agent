@@ -85,7 +85,22 @@ class KVCAwareBalancer:
             "on_servers_removed": [],
         }
         self._store = DataStore()
+        self._init_cache_registry()
         self._init_provider()
+
+    def _init_cache_registry(self) -> None:
+        """Install one shared layout from one replica before event collection."""
+        replica_id, handle = next(iter(self._servers.items()))
+        if not hasattr(handle, "get_kv_cache_metadata"):
+            metadata = {"status": "unsupported", "reason": "metadata_method_unavailable"}
+        else:
+            try:
+                metadata = ray.get(handle.get_kv_cache_metadata.remote(), timeout=self._DISCOVERY_TIMEOUT_SECONDS)
+            except Exception as exc:
+                metadata = {"status": "error", "reason": f"metadata_query_failed:{type(exc).__name__}"}
+        state = self._store.configure_cache_registry(metadata)
+        if state.status not in {"registered", "disabled"}:
+            logger.warning("Cache registry unavailable (source replica %s): %s", replica_id, state.reason)
 
     def _fetch_rollout_config(self) -> Any | None:
         """Return the first available rollout config."""

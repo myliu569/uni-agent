@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for VLLMKVParser layer bucketing (mixed-medium frames)."""
+"""Unit tests for vLLM KV event normalization and per-layer updates."""
 
 from __future__ import annotations
 
@@ -126,9 +126,10 @@ def test_parse_failure_surfaces_exception_not_swallowed():
 def test_mapping_matches_array_normalization(medium):
     """Field-named events normalize identically, including real upstream tags."""
     array_events = [
-        ["BlockStored", [101, 102], 100, [1, 2, 3, 4], 2, None, medium],
+        ["BlockStored", [101, 102], 100, [1, 2, 3, 4], 2, None, medium, None, None, 0, "full_attention"],
         ["BlockRemoved", [101], medium, 0],
         ["AllBlocksCleared"],
+        ["BlockStored", [103], None, list(range(16)), 8, None, medium, None, [None], 1, "mamba"],
     ]
     mapping_events = [
         {
@@ -144,12 +145,25 @@ def test_mapping_matches_array_normalization(medium):
         },
         {"type": "BlockRemoved", "block_hashes": [101], "medium": medium, "group_idx": 0},
         {"type": "AllBlocksCleared"},
+        {
+            "type": "BlockStored",
+            "block_hashes": [103],
+            "token_ids": list(range(16)),
+            "block_size": 8,
+            "medium": medium,
+            "extra_keys": [None],
+            "group_idx": 1,
+            "kv_cache_spec_kind": "mamba",
+        },
     ]
     if medium is None:
         for event in mapping_events:
             event.pop("medium", None)
     expected = KVCacheEvent.from_raw([0, array_events, 0], "node1")
-    assert len(expected) == 3
+    assert len(expected) == 4
+    assert expected[-1].raw_token_ids == tuple(range(16))
+    assert expected[-1].block_hashes == ["103"]
+    assert (expected[-1].group_idx, expected[-1].kind, expected[-1].block_size) == (1, "mamba", 8)
     assert KVCacheEvent.from_raw([0, mapping_events, 0], "node1") == expected
 
 
@@ -184,7 +198,7 @@ def test_bad_mapping_does_not_discard_valid_sibling(caplog):
     module_logger.addHandler(caplog.handler)
     try:
         with caplog.at_level(logging.DEBUG, logger=KVCacheEvent.__module__):
-            events = KVCacheEvent.from_raw([0, [bad_event, valid]], "node1")
+            events = KVCacheEvent.from_raw([0, [bad_event, ["FutureEvent", "unknown"], valid]], "node1")
     finally:
         module_logger.removeHandler(caplog.handler)
     assert "Skipping malformed KV event (type=stored, node=node1)" in caplog.text
