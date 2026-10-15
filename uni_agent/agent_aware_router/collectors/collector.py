@@ -157,22 +157,28 @@ class Collector:
 
     def _write_kv_update(self, update: KVCacheUpdate) -> None:
         """Write KVCacheUpdate via DataStore, then emit a periodic kv-events tally."""
-        if update.block_size is not None:
-            self._data_store.set_block_size(update.block_size)
-        if update.clear_all:
-            self._data_store.clear_kv_node(update.node_id)
-        for layer, hashes in update.remove_blocks.items():
-            if hashes:
-                self._data_store.remove_kv_blocks(update.node_id, hashes, layer=layer)
-        for layer, hashes in update.add_blocks.items():
-            if hashes:
-                self._data_store.add_kv_blocks(update.node_id, hashes, layer=layer)
+        if update.group_events is not None:
+            self._data_store.apply_group_events(update.node_id, update.group_events)
+            n_added = sum(len(e.block_hashes) for e in update.group_events if e.is_store)
+            n_removed = sum(len(e.block_hashes) for e in update.group_events if e.is_remove)
+            n_clear = sum(e.is_clear for e in update.group_events)
+        else:
+            if update.block_size is not None:
+                self._data_store.set_block_size(update.block_size)
+            if update.clear_all:
+                self._data_store.clear_kv_node(update.node_id)
+            for layer, hashes in update.remove_blocks.items():
+                if hashes:
+                    self._data_store.remove_kv_blocks(update.node_id, hashes, layer=layer)
+            for layer, hashes in update.add_blocks.items():
+                if hashes:
+                    self._data_store.add_kv_blocks(update.node_id, hashes, layer=layer)
+            n_added = sum(len(v) for v in update.add_blocks.values())
+            n_removed = sum(len(v) for v in update.remove_blocks.values())
+            n_clear = int(update.clear_all)
 
-        # Tally for periodic summary — observe BlockStored/BlockRemoved flow.
-        n_added = sum(len(v) for v in update.add_blocks.values())
-        n_removed = sum(len(v) for v in update.remove_blocks.values())
-        if update.clear_all:
-            self._kv_event_counts["clear"] += 1
+        # Count event hashes, never treat this tally as physical capacity.
+        self._kv_event_counts["clear"] += n_clear
         if n_added:
             self._kv_event_counts["stored"] += 1
             self._kv_block_counts["stored"] += n_added
@@ -189,10 +195,15 @@ class Collector:
         total = sum(self._kv_event_counts.values())
         if total - self._kv_last_logged_total >= _KV_EVENT_LOG_INTERVAL_S:
             self._kv_last_logged_total = total
+            detail = (
+                "group_aware=True"
+                if update.group_events is not None
+                else f"retained_blocks/replica={self._data_store.per_replica_block_counts()}"
+            )
             logger.debug(
                 f"kv-events tally: events={dict(self._kv_event_counts)} "
                 f"blocks={dict(self._kv_block_counts)} (total_events={total}) | "
-                f"retained_blocks/replica={self._data_store.per_replica_block_counts()}"
+                f"{detail}"
             )
 
     def _write_metrics_update(self, update: MetricsUpdate) -> None:
@@ -462,7 +473,7 @@ def get_collector(
             max_retry_attempts=_debug_knob("max_retry_attempts"),
             retry_backoff_factor=_debug_knob("retry_backoff_factor"),
         )
-        return Collector(transport, VLLMKVParser())
+        return Collector(transport, VLLMKVParser(group_aware=DataStore().group_cache_enabled))
 
     if name == "sticky_stat":
         from .parse.basic.sticky import StickyParser

@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from ..types import Layer
+from ..utils.native_hash import NativeHashIndex
+from .cache_registry import CacheRegistryState, build_cache_registry
+from .group_cache import GroupCache, PrefixEstimate
 
 
 class KVCacheStore:
@@ -35,6 +38,11 @@ class KVCacheStore:
 
     def __init__(self) -> None:
         self.block_size: int | None = None
+        self._registry_state = CacheRegistryState()
+        self.registry_configured = False
+        self.registry_generation = 0
+        self.group_caches: dict[str, GroupCache] = {}
+        self.native_hashes: NativeHashIndex | None = None
         self.replicas_by_block: dict[str, set[str]] = {}
         # Per-layer per-replica block counts, maintained alongside replicas_by_block.
         self._replica_layer_counts: dict[Layer, dict[str, int]] = {
@@ -51,6 +59,75 @@ class KVCacheStore:
             cls._instance = cls()
         return cls._instance
 
+    @property
+    def registry_state(self) -> CacheRegistryState:
+        """The pool's immutable layout, or the reason registration is unavailable."""
+        with self._lock:
+            return self._registry_state
+
+    def configure_registry(self, metadata) -> CacheRegistryState:
+        """Install a complete validated layout before collectors start."""
+        state = build_cache_registry(metadata)
+        with self._lock:
+            self._registry_state = state
+            registry = state.registry
+            self.native_hashes = None
+            full_sizes = (
+                [group.block_size for group in registry.required_groups if group.match_kind == "full"] if registry else []
+            )
+            if full_sizes and registry.local_hash_unit not in full_sizes:
+                self.native_hashes = NativeHashIndex.from_metadata(metadata, registry.local_hash_unit)
+            # Missing/unavailable metadata keeps the original event path.
+            # An explicit layout (even unsupported/invalid) or disabled prefix
+            # caching must not silently fall back to Full-style indexing.
+            self.registry_configured = (
+                state.registry is not None
+                or state.status == "disabled"
+                or (isinstance(metadata, Mapping) and "groups" in metadata)
+            )
+            self.registry_generation += 1
+            self.group_caches.clear()
+        return state
+
+    def apply_group_events(self, node_id, events) -> None:
+        with self._lock:
+            registry = self._registry_state.registry
+            if registry is None:
+                return
+            native = self.native_hashes
+            revision = native.identity_revision if native else 0
+            index = self.group_caches.get(node_id)
+            if index is None:
+                index = self.group_caches[node_id] = GroupCache(registry, node_id, native_hashes=native)
+            index.apply(events)
+            while native is not None and native.enabled and revision != native.identity_revision:
+                revision = native.identity_revision
+                for cache in self.group_caches.values():
+                    cache.apply([])
+
+    def estimate_prefixes(self, node_ids, hashes, query_tokens) -> dict[str, PrefixEstimate] | None:
+        with self._lock:
+            if not self.registry_configured:
+                return None  # Original single-group protocol remains available.
+            state = self._registry_state
+            result = {}
+            for node in node_ids:
+                index = self.group_caches.get(node)
+                if state.registry is None:
+                    result[node] = PrefixEstimate(state.status, 0, query_tokens, 0, None, state.reason)
+                elif index is None:
+                    result[node] = PrefixEstimate(
+                        "warming",
+                        0,
+                        query_tokens,
+                        max(0, query_tokens - 1),
+                        state.registry.local_hash_unit,
+                        "no_events",
+                    )
+                else:
+                    result[node] = index.estimate(hashes, query_tokens)
+            return result
+
     # ── Replica management ──────────────────────────────────────────────
 
     def clear_replica(self, replica_id: str) -> None:
@@ -59,6 +136,7 @@ class KVCacheStore:
         O(n) in the number of unique blocks, but replica count is typically small (< 100).
         """
         with self._lock:
+            self.group_caches.pop(replica_id, None)
             stale_hashes: list[str] = []
             for bh, replicas in self.replicas_by_block.items():
                 if replica_id not in replicas:
@@ -106,12 +184,15 @@ class KVCacheStore:
     # ── Retained-cache size ─────────────────────────────────────────────
 
     def per_replica_block_counts(self) -> dict[str, int]:
-        """Return ``{replica_id: number of distinct GPU prefix blocks it retains}``.
+        """Return per-replica GPU cache retention estimates in O(replicas).
 
-        GPU-only count — feeds the retained-load formula. Maintained incrementally,
-        O(replicas). Divide by the per-replica block pool size for occupancy.
+        Hybrid counts published group/hash identities, including unresolved
+        events, not local hash units or deduplicated physical blocks. Legacy
+        keeps its original incremental event counts.
         """
         with self._lock:
+            if self.registry_configured:
+                return {node: len(index.retained_hashes) for node, index in self.group_caches.items()}
             return dict(self._replica_layer_counts.get(Layer.GPU, {}))
 
     # ── Prefix hit rate queries ─────────────────────────────────────────

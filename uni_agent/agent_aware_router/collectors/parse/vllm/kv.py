@@ -53,7 +53,8 @@ class VLLMKVParser(Parser):
     # Only None (older vLLM) defaults to GPU; unknown media remain unclassified.
     _MEDIUM_TO_LAYER: dict[str, Layer] = {"GPU": Layer.GPU, "CPU": Layer.CPU, "SSD": Layer.SSD}
 
-    def __init__(self) -> None:
+    def __init__(self, *, group_aware: bool = False) -> None:
+        self.group_aware = group_aware
         self.remote_to_local_block_hash: dict[str, str] = {}
         self._block_size: int | None = None
         self._filtered_event_counts: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
@@ -82,15 +83,17 @@ class VLLMKVParser(Parser):
         try:
             raw = msgpack.unpackb(raw_data, raw=False)
 
-            if not isinstance(raw, list) or len(raw) == 0:
-                logger.warning(f"Unexpected msgpack format from node {node_id} (type={type(raw).__name__})")
-                return None
-            event_payloads = raw if isinstance(raw[0], list) else [raw]
+            if not isinstance(raw, list | dict) or len(raw) == 0:
+                raise ValueError(f"Unexpected msgpack format (type={type(raw).__name__})")
+            event_payloads = raw if isinstance(raw, list) and isinstance(raw[0], list | dict) else [raw]
 
-            update = KVCacheUpdate(node_id=node_id)
+            update = KVCacheUpdate(node_id=node_id, group_events=[] if self.group_aware else None)
             for payload in event_payloads:
                 events = KVCacheEvent.from_raw(payload, default_node_id=node_id)
                 for event in events:
+                    if self.group_aware:
+                        update.group_events.append(event)
+                        continue
                     if event.event_type == "stored":
                         self._on_block_stored(event, update)
                     elif event.event_type == "removed":
@@ -150,7 +153,8 @@ class VLLMKVParser(Parser):
         if layer != Layer.GPU:
             self._record_filtered_event(event, layer)
             return
-        if event.token_ids is None:
+        token_ids = event.token_ids
+        if token_ids is None:
             logger.debug("Stored event has no token_ids — skipping")
             return
 
@@ -166,7 +170,7 @@ class VLLMKVParser(Parser):
                 local_parent_hash = int(local_parent_str)
 
         local_hashes: list[str] = []
-        for i, block_bytes in enumerate(event.token_ids):
+        for i, block_bytes in enumerate(token_ids):
             if i >= len(event.block_hashes):
                 break
             local_hash_int = compute_hash(
