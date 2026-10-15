@@ -20,6 +20,7 @@ import threading
 from collections.abc import Iterable, Mapping
 
 from ..types import Layer
+from ..types.cache_lifecycle import CacheLifecycleState
 from ..utils.native_hash import NativeHashIndex
 from .cache_registry import CacheRegistryState, build_cache_registry
 from .group_cache import GroupCache, PrefixEstimate
@@ -43,6 +44,10 @@ class KVCacheStore:
         self.registry_generation = 0
         self.group_caches: dict[str, GroupCache] = {}
         self.native_hashes: NativeHashIndex | None = None
+        self.lifecycle_states: dict[str, CacheLifecycleState] = {}
+        self._retired_instances: dict[str, set[str]] = {}
+        self._stream_errors: dict[str, str] = {}
+        self._event_sequences: dict[str, int] = {}
         self.replicas_by_block: dict[str, set[str]] = {}
         # Per-layer per-replica block counts, maintained alongside replicas_by_block.
         self._replica_layer_counts: dict[Layer, dict[str, int]] = {
@@ -73,7 +78,9 @@ class KVCacheStore:
             registry = state.registry
             self.native_hashes = None
             full_sizes = (
-                [group.block_size for group in registry.required_groups if group.match_kind == "full"] if registry else []
+                [group.block_size for group in registry.required_groups if group.match_kind == "full"]
+                if registry
+                else []
             )
             if full_sizes and registry.local_hash_unit not in full_sizes:
                 self.native_hashes = NativeHashIndex.from_metadata(metadata, registry.local_hash_unit)
@@ -87,23 +94,102 @@ class KVCacheStore:
             )
             self.registry_generation += 1
             self.group_caches.clear()
+            self.lifecycle_states.clear()
+            self._retired_instances.clear()
+            self._stream_errors.clear()
+            self._event_sequences.clear()
         return state
 
-    def apply_group_events(self, node_id, events) -> None:
+    def update_lifecycle(self, node_id, state: CacheLifecycleState) -> bool:
         with self._lock:
-            registry = self._registry_state.registry
-            if registry is None:
-                return
-            native = self.native_hashes
-            revision = native.identity_revision if native else 0
-            index = self.group_caches.get(node_id)
-            if index is None:
-                index = self.group_caches[node_id] = GroupCache(registry, node_id, native_hashes=native)
-            index.apply(events)
-            while native is not None and native.enabled and revision != native.identity_revision:
-                revision = native.identity_revision
-                for cache in self.group_caches.values():
-                    cache.apply([])
+            previous = self.lifecycle_states.get(node_id)
+            retired = self._retired_instances.setdefault(node_id, set())
+            if state.instance_id in retired:
+                return False
+            changed_identity = previous is None or previous.instance_id != state.instance_id
+            if not changed_identity and (state.epoch < previous.epoch or state.revision <= previous.revision):
+                return False
+            if previous is not None and changed_identity:
+                retired.add(previous.instance_id)
+            changed_epoch = changed_identity or state.epoch != previous.epoch
+            self.lifecycle_states[node_id] = state
+            if changed_epoch or state.index_state != "ready":
+                self._clear_replica_locked(node_id)
+            if changed_epoch:
+                self._stream_errors.pop(node_id, None)
+                self._event_sequences.pop(node_id, None)
+            return True
+
+    def _cache_ready_locked(self, node_id):
+        state = self.lifecycle_states.get(node_id)
+        return node_id not in self._stream_errors and (state is None or state.index_state == "ready")
+
+    def apply_update(self, update):
+        """Check identity and write one ordered parser result under one lock."""
+        with self._lock:
+            node = update.node_id
+            if update.reset_stream:
+                self._clear_replica_locked(node)
+                self._stream_errors.pop(node, None)
+                self._event_sequences.pop(node, None)
+                return True
+            if update.stream_error:
+                current = self.lifecycle_states.get(node)
+                if (
+                    update.lifecycle is not None
+                    and current is not None
+                    and (current.instance_id != update.lifecycle.instance_id or current.epoch != update.lifecycle.epoch)
+                ):
+                    return False
+                self._stream_errors[node] = update.stream_error
+                self._clear_replica_locked(node)
+                return False
+            current = self.lifecycle_states.get(node)
+            received = update.lifecycle
+            if received is not None and current is None:
+                return False  # Bridge identities must first arrive through the control handshake.
+            if current is not None and (
+                received is None
+                or current.instance_id != received.instance_id
+                or current.epoch != received.epoch
+                or current.index_state != "ready"
+                or received.index_state != "ready"
+            ):
+                return False
+            if update.sequence is not None:
+                if update.sequence <= self._event_sequences.get(node, -1):
+                    return False
+                self._event_sequences[node] = update.sequence
+            has_clear = update.clear_all or any(event.is_clear for event in update.group_events or [])
+            if node in self._stream_errors:
+                if not has_clear:
+                    return False
+                self._stream_errors.pop(node, None)
+            if update.group_events is not None:
+                registry = self._registry_state.registry
+                if registry is None:
+                    return False
+                native = self.native_hashes
+                revision = native.identity_revision if native else 0
+                index = self.group_caches.get(node)
+                if index is None:
+                    index = self.group_caches[node] = GroupCache(registry, node, native_hashes=native)
+                index.apply(update.group_events)
+                while native is not None and native.enabled and revision != native.identity_revision:
+                    revision = native.identity_revision
+                    for cache_node, cache in self.group_caches.items():
+                        if self._cache_ready_locked(cache_node):
+                            cache.apply([])
+            else:
+                if update.block_size is not None and self.block_size is None:
+                    self.block_size = update.block_size
+                if update.clear_all:
+                    self._clear_replica_locked(node)
+                for layer, hashes in update.remove_blocks.items():
+                    self._remove_blocks_locked(node, hashes, layer)
+                for layer, hashes in update.add_blocks.items():
+                    self._add_blocks_locked(node, hashes, layer)
+            return True
 
     def estimate_prefixes(self, node_ids, hashes, query_tokens) -> dict[str, PrefixEstimate] | None:
         with self._lock:
@@ -113,7 +199,18 @@ class KVCacheStore:
             result = {}
             for node in node_ids:
                 index = self.group_caches.get(node)
-                if state.registry is None:
+                if not self._cache_ready_locked(node):
+                    lifetime = self.lifecycle_states.get(node)
+                    reason = self._stream_errors.get(node) or (lifetime.reason if lifetime else "cache_unknown")
+                    result[node] = PrefixEstimate(
+                        "warming",
+                        0,
+                        query_tokens,
+                        0,
+                        state.registry.local_hash_unit if state.registry else None,
+                        reason,
+                    )
+                elif state.registry is None:
                     result[node] = PrefixEstimate(state.status, 0, query_tokens, 0, None, state.reason)
                 elif index is None:
                     result[node] = PrefixEstimate(
@@ -136,18 +233,21 @@ class KVCacheStore:
         O(n) in the number of unique blocks, but replica count is typically small (< 100).
         """
         with self._lock:
-            self.group_caches.pop(replica_id, None)
-            stale_hashes: list[str] = []
-            for bh, replicas in self.replicas_by_block.items():
-                if replica_id not in replicas:
-                    continue
-                replicas.discard(replica_id)
-                if not replicas:
-                    stale_hashes.append(bh)
-            for bh in stale_hashes:
-                del self.replicas_by_block[bh]
-            for layer_counts in self._replica_layer_counts.values():
-                layer_counts.pop(replica_id, None)
+            self._clear_replica_locked(replica_id)
+
+    def _clear_replica_locked(self, replica_id):
+        self.group_caches.pop(replica_id, None)
+        stale_hashes: list[str] = []
+        for bh, replicas in self.replicas_by_block.items():
+            if replica_id not in replicas:
+                continue
+            replicas.discard(replica_id)
+            if not replicas:
+                stale_hashes.append(bh)
+        for bh in stale_hashes:
+            del self.replicas_by_block[bh]
+        for layer_counts in self._replica_layer_counts.values():
+            layer_counts.pop(replica_id, None)
 
     # ── Block management ────────────────────────────────────────────────
 
@@ -158,28 +258,34 @@ class KVCacheStore:
         prefix-hit routing); CPU/SSD blocks are counted only.
         """
         with self._lock:
-            layer_counts = self._replica_layer_counts.setdefault(layer, {})
-            for bh in block_hashes:
-                layer_counts[replica_id] = layer_counts.get(replica_id, 0) + 1
-                if layer != Layer.GPU:
-                    continue
-                if bh not in self.replicas_by_block:
-                    self.replicas_by_block[bh] = set()
-                self.replicas_by_block[bh].add(replica_id)
+            self._add_blocks_locked(replica_id, block_hashes, layer)
+
+    def _add_blocks_locked(self, replica_id, block_hashes, layer):
+        layer_counts = self._replica_layer_counts.setdefault(layer, {})
+        for bh in block_hashes:
+            layer_counts[replica_id] = layer_counts.get(replica_id, 0) + 1
+            if layer != Layer.GPU:
+                continue
+            if bh not in self.replicas_by_block:
+                self.replicas_by_block[bh] = set()
+            self.replicas_by_block[bh].add(replica_id)
 
     def remove_blocks(self, replica_id: str, block_hashes: Iterable[str], layer: Layer = Layer.GPU) -> None:
         """Remove blocks from a replica at a layer, updating the reverse index."""
         with self._lock:
-            layer_counts = self._replica_layer_counts.setdefault(layer, {})
-            for bh in block_hashes:
-                layer_counts[replica_id] = layer_counts.get(replica_id, 0) - 1
-                if layer != Layer.GPU:
-                    continue
-                replicas = self.replicas_by_block.get(bh)
-                if replicas is not None and replica_id in replicas:
-                    replicas.discard(replica_id)
-                    if not replicas:
-                        del self.replicas_by_block[bh]
+            self._remove_blocks_locked(replica_id, block_hashes, layer)
+
+    def _remove_blocks_locked(self, replica_id, block_hashes, layer):
+        layer_counts = self._replica_layer_counts.setdefault(layer, {})
+        for bh in block_hashes:
+            layer_counts[replica_id] = layer_counts.get(replica_id, 0) - 1
+            if layer != Layer.GPU:
+                continue
+            replicas = self.replicas_by_block.get(bh)
+            if replicas is not None and replica_id in replicas:
+                replicas.discard(replica_id)
+                if not replicas:
+                    del self.replicas_by_block[bh]
 
     # ── Retained-cache size ─────────────────────────────────────────────
 
@@ -192,7 +298,10 @@ class KVCacheStore:
         """
         with self._lock:
             if self.registry_configured:
-                return {node: len(index.retained_hashes) for node, index in self.group_caches.items()}
+                return {
+                    node: len(index.retained_hashes) if self._cache_ready_locked(node) else 0
+                    for node, index in self.group_caches.items()
+                }
             return dict(self._replica_layer_counts.get(Layer.GPU, {}))
 
     # ── Prefix hit rate queries ─────────────────────────────────────────
@@ -219,6 +328,8 @@ class KVCacheStore:
         if layer != Layer.GPU or self.block_size is None:
             return 0.0
         with self._lock:
+            if not self._cache_ready_locked(node_id):
+                return 0.0
             return self._gpu_hit_rate_locked(node_id, hash_strs)
 
     def _gpu_hit_rate_locked(self, node_id: str, hash_strs: list[str]) -> float:

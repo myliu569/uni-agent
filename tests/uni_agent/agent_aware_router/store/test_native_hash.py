@@ -2,6 +2,7 @@
 
 import pytest
 
+from uni_agent.agent_aware_router.collectors.parse.base import KVCacheUpdate
 from uni_agent.agent_aware_router.store.group_cache import GroupCache
 from uni_agent.agent_aware_router.store.kv_cache_store import KVCacheStore
 from uni_agent.agent_aware_router.utils.hash import get_prefix_hashes_incremental
@@ -45,13 +46,13 @@ def test_full_event_identity_is_shared_across_replica_caches(full_node, version,
     metadata["vllm_version"] = version
     value.configure_registry(metadata)
     full, sparse = events
-    value.apply_group_events("a", sparse)
+    value.apply_update(KVCacheUpdate(node_id="a", group_events=sparse))
     a = value.group_caches["a"]
     assert hit(a) == 0 and a.pending
-    value.apply_group_events(full_node, full)
+    value.apply_update(KVCacheUpdate(node_id=full_node, group_events=full))
     assert not a.pending and len(a.by_group[0]) == 3
     assert hit(a) == (16 if full_node == "a" else 0)
-    value.apply_group_events("a", full)
+    value.apply_update(KVCacheUpdate(node_id="a", group_events=full))
     assert hit(a) == 16
 
 

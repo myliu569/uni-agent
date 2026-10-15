@@ -269,6 +269,10 @@ def test_wire_events_update_hash_mapping_and_remove(replay):
         added.extend(update.add_blocks[Layer.GPU])
     assert len(added) == 3
     assert list(parser.remote_to_local_block_hash.values()) == added
+    snapshot = parser.snapshot()
+    snapshot.parse(msgpack.packb([2, [mapping_event(["AllBlocksCleared"])]]), "node1")
+    assert not snapshot.remote_to_local_block_hash
+    assert list(parser.remote_to_local_block_hash.values()) == added
     removed = parser.parse(msgpack.packb([2, [mapping_event(["BlockRemoved", [102], "GPU", 0])], 0]), "node1")
     assert removed is not None
     assert removed.remove_blocks[Layer.GPU] == [added[1]]

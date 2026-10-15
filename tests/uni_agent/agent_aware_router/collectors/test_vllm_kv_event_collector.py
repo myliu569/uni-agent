@@ -25,7 +25,9 @@ No real vLLM service is required.
 
 from __future__ import annotations
 
+import asyncio
 import time
+from threading import Event, Thread, Timer
 from unittest.mock import Mock
 
 import pytest
@@ -39,6 +41,91 @@ from uni_agent.agent_aware_router.types import Layer
 from uni_agent.agent_aware_router.utils.hash import get_prefix_hashes_incremental
 
 WAIT = 0.3
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_stop_timeout_keeps_thread_reference_and_prevents_restart(monkeypatch):
+    from uni_agent.agent_aware_router.collectors import collector as module
+
+    collector = _make_collector([])
+    collector.start()
+    thread = collector._loop_thread
+    join = thread.join
+    entered, release = Event(), Event()
+
+    def block():
+        entered.set()
+        release.wait(3)
+
+    collector._loop.call_soon_threadsafe(block)
+    assert entered.wait(1)
+    submit = asyncio.run_coroutine_threadsafe
+
+    def short_wait(coroutine, loop):
+        future = submit(coroutine, loop)
+        result = future.result
+        patch.setattr(future, "result", lambda timeout: result(0.01))
+        return future
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(module.asyncio, "run_coroutine_threadsafe", short_wait)
+            patch.setattr(thread, "join", lambda timeout: join(0.01))
+            with pytest.raises(TimeoutError, match="cleanup timed out"):
+                collector.stop()
+            assert collector._loop_thread is thread and thread.is_alive()
+            assert collector._loop.is_running() and collector._stop_future is not None
+            with pytest.raises(RuntimeError, match="stop the collector"):
+                collector.start()
+    finally:
+        release.set()
+        try:
+            collector.stop()
+        finally:
+            if thread.is_alive():
+                collector._loop.call_soon_threadsafe(collector._loop.stop)
+            join(3)
+            if not collector._loop.is_closed():
+                pending = asyncio.all_tasks(collector._loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    collector._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                collector._loop.close()
+        assert not thread.is_alive() and collector._loop.is_closed()
+
+
+@pytest.mark.cpu
+@pytest.mark.level0
+def test_stop_waits_for_a_thread_whose_event_loop_has_not_started(monkeypatch):
+    collector = _make_collector([])
+    entered, release = Event(), Event()
+
+    def delayed_loop():
+        entered.set()
+        release.wait(3)
+        collector._loop.run_forever()
+
+    thread = Thread(target=delayed_loop, daemon=True)
+    collector._loop_thread = thread
+    thread.start()
+    assert entered.wait(1)
+    join = thread.join
+    monkeypatch.setattr(thread, "join", lambda timeout: join(1))
+    resume = Timer(0.02, release.set)
+    resume.start()
+    try:
+        collector.stop()
+        assert not thread.is_alive()
+        assert collector._loop.is_closed()
+    finally:
+        release.set()
+        if not collector._loop.is_closed():
+            collector._loop.call_soon_threadsafe(collector._loop.stop)
+        join(3)
+        resume.join()
+        collector.stop()
 
 
 def _make_collector(payloads, *, group_aware=False):

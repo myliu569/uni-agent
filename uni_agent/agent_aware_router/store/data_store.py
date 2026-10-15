@@ -114,8 +114,15 @@ class DataStore:
         unit = registry.local_hash_unit if registry else self.get_block_size()
         return self._kv.registry_generation, unit
 
-    def apply_group_events(self, node_id, events) -> None:
-        self._kv.apply_group_events(node_id, events)
+    def cache_lifecycle_state(self, node_id):
+        with self._kv._lock:
+            return self._kv.lifecycle_states.get(node_id)
+
+    def update_cache_lifecycle(self, node_id, state):
+        return self._kv.update_lifecycle(node_id, state)
+
+    def apply_kv_update(self, update):
+        return self._kv.apply_update(update)
 
     def estimate_prefixes(self, node_ids, hashes, query_tokens):
         return self._kv.estimate_prefixes(node_ids, hashes, query_tokens)

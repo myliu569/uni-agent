@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native cache metadata on top of the existing verl server."""
+"""Cache metadata and synchronized lifecycle on top of the existing verl server."""
 
 import asyncio
 import json
@@ -25,8 +25,10 @@ import vllm
 
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
 
+from .lifecycle_server import CacheLifecycleServerMixin
 
-class KVMetadataHttpServer(vLLMHttpServer):
+
+class KVMetadataHttpServer(CacheLifecycleServerMixin, vLLMHttpServer):
     """Expose native groups and resolved engine configuration to the router."""
 
     _METADATA_RPC_TIMEOUT = 30.0
